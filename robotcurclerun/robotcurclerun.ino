@@ -105,7 +105,7 @@ void setBalanceKp(float k) {
 }
 
 // Hardware Trim Ratio for Left Motor (calibrated: Left motor ENA is naturally faster)
-float MOTOR_L_RATIO = 0.825;
+float MOTOR_L_RATIO = 0.82;
 
 void setMotorLRatio(float ratio) {
   MOTOR_L_RATIO = ratio;
