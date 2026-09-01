@@ -348,7 +348,10 @@ void spinInPlace(int degrees, bool clockwise, int spinSpeed = 200) {
   long targetPulses = (long)(PULSES_PER_DEGREE * degrees + 0.5);
   unsigned long spinStart = millis();
 
-  analogWrite(ENA, spinSpeed);
+  // Same left-motor trim as forward()/backward() — ENA runs naturally faster,
+  // and spinInPlace previously drove both sides at equal PWM (see TUNING_LOG.md
+  // on left-wheel-too-strong drive symptoms after adding this function).
+  analogWrite(ENA, (int)(spinSpeed * MOTOR_L_RATIO));
   analogWrite(ENB, spinSpeed);
 
   while ((long)(pulse_count_L - start_L) + (long)(pulse_count_R - start_R) < targetPulses * 2) {
