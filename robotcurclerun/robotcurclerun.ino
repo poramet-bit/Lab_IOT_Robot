@@ -1,5 +1,5 @@
 #include "Arduino_LED_Matrix.h"
-#include "../animation/animation.h"
+#include "/home/poramet/Documents/Lab_IOT_Robot/animation/animation.h"
 
 ArduinoLEDMatrix matrix;
 
@@ -25,8 +25,46 @@ const int ENCODER_L = 11;
 const int ENCODER_R = 3;
 const int DISK_SLOTS = 20; // 20 slots per revolution
 
+// Path-following geometry.
+const float WHEELBASE_M = 0.10; // 10 cm between wheel centers (still theoretical, not field-calibrated)
+// PULSES_PER_METER field-calibrated: robot covered measured 450 cm in ~473 avg
+// pulses. Theoretical 65mm-wheel estimate was 97.9 pulses/m, off by ~7% (real
+// wheel slip / effective rolling diameter differs from nominal).
+const float PULSES_PER_METER = 105.1;
+// Point turns scrub the tires sideways instead of rolling cleanly, so pure
+// wheelbase geometry under-predicts the pulses needed per degree. Empirical
+// tuning trail: uncorrected -> commanded 90 deg gave ~45 deg real (needed ~2x);
+// factor 2.0 -> commanded 90 deg gave ~105 deg real (overshoot by 105/90);
+// corrected to 2.0 * (90/105) ~= 1.71.
+const float SPIN_SLIP_FACTOR = 1.71;
+const float PULSES_PER_DEGREE = (WHEELBASE_M * PI / 360.0) * PULSES_PER_METER * SPIN_SLIP_FACTOR; // ~0.183
+
+// Fixed route: each step drives straight for distance_m, does a 360-degree
+// flourish spin, then (if has_turn) an extra 90-degree turn before the next
+// step. The last step has no turn — the robot stops after its spin.
+struct PathStep {
+  float distance_m;
+  bool spin_clockwise;
+  bool has_turn;
+  bool turn_clockwise;
+};
+
+const PathStep PATH[] = {
+  { 4.5, true,  true,  true },  // straight 4.5 m, spin right 360, turn right 90
+  { 5.7, false, true,  true },  // straight 5.7 m, spin left 360, turn right 90
+  { 4.5, true,  true,  true },  // straight 4.5 m, spin right 360, turn right 90
+  { 5.7, false, true,  true },  // straight 5.7 m, spin left 360, turn right 90
+  { 4.5, true,  false, false }, // straight 4.5 m, spin right 360, then stop
+};
+const int PATH_LEN = sizeof(PATH) / sizeof(PATH[0]);
+int path_index = 0;
+bool path_done = false;
+
 volatile unsigned long pulse_count_L = 0;
 volatile unsigned long pulse_count_R = 0;
+
+unsigned long milestone_start_L = 0;
+unsigned long milestone_start_R = 0;
 
 // Interrupt Service Routines (ISRs)
 void isr_count_L() {
@@ -230,12 +268,14 @@ void right_turn(int speed_motorR = 200,int speed_motorL = 0, int B_L = 0, int B_
 
 
 
-void left_turn(int speed_motorL = 200, int speed_motorR = 0,int B_L = 0, int B_R = 0) {
+void left_turn(int speed_motorL = 0, int speed_motorR = 200, int B_L = 0, int B_R = 0) {
 
   // Define parameter for L298N
-
-  digitalWrite(IN1, 0);
-  digitalWrite(IN2, 1);
+  // Right wheel drives forward while left wheel stays stationary, pivoting
+  // the chassis toward the (stationary) left side. Driving the left wheel
+  // instead (old code) pivots toward the right side, i.e. turns the wrong way.
+  digitalWrite(IN3, 0);
+  digitalWrite(IN4, 1);
 
   //Define speed for motor
 
@@ -291,6 +331,61 @@ void right_turnback(int speed_motorL = 200, int speed_motorR = 200, int B_L = 0,
     delay(radar[i][3]); // 66 ms frame delay
   }
 }
+// Encoder-gated in-place spin. clockwise=true turns the nose right.
+// NOTE: branches intentionally inverted vs. the geometric derivation — on the
+// physical robot that math had the direction backwards (confirmed on hardware).
+void spinInPlace(int degrees, bool clockwise, int spinSpeed = 200) {
+  if (clockwise) {
+    digitalWrite(IN1, 1); digitalWrite(IN2, 0); // left backward
+    digitalWrite(IN3, 0); digitalWrite(IN4, 1); // right forward
+  } else {
+    digitalWrite(IN1, 0); digitalWrite(IN2, 1); // left forward
+    digitalWrite(IN3, 1); digitalWrite(IN4, 0); // right backward
+  }
+
+  unsigned long start_L = pulse_count_L;
+  unsigned long start_R = pulse_count_R;
+  long targetPulses = (long)(PULSES_PER_DEGREE * degrees + 0.5);
+  unsigned long spinStart = millis();
+
+  analogWrite(ENA, spinSpeed);
+  analogWrite(ENB, spinSpeed);
+
+  while ((long)(pulse_count_L - start_L) + (long)(pulse_count_R - start_R) < targetPulses * 2) {
+    if (millis() - spinStart > 5000) { // safety: encoder stall (see TUNING_LOG.md)
+      Serial.println("spinInPlace: timeout, aborting");
+      break;
+    }
+  }
+
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+// Runs the spin (+ optional turn) maneuver for the current PATH step, then
+// advances to the next step or marks the route complete on the last one.
+void runPathStepManeuver() {
+  const PathStep &step = PATH[path_index];
+  Serial.print("Path step ");
+  Serial.print(path_index);
+  Serial.println(" maneuver");
+
+  spinInPlace(360, step.spin_clockwise);
+  delay(200);
+  if (step.has_turn) {
+    spinInPlace(90, step.turn_clockwise);
+    delay(200);
+  }
+
+  milestone_start_L = pulse_count_L;
+  milestone_start_R = pulse_count_R;
+  path_index++;
+  if (path_index >= PATH_LEN) {
+    path_done = true;
+    stop();
+  }
+}
+
 void stop() {
   analogWrite(ENA, 0);
 
@@ -338,32 +433,17 @@ void loadFlippedXYFrame(const uint32_t frame[4]) {
   loadTransformedFrame(frame, true, true);
 }
 void loop() {
-  // put your main code here, to run repeatedly:
-  int d_time = 1000;
-  /*
-  Sv(180);
-  Sv(90);
-  Sv(45);
-  Sv(0);
-  Sv(90);
-  */
-  
+  if (path_done) {
+    return; // route finished, stop() already called
+  }
+
   forward();
   delay(1000);
   printEncoderStatus();
-  /*
-  backward();
-  delay(1000);
-  right_turn();
-  delay(1000);
-  left_turn();
-  delay(1000);
-  left_turnback();
-  delay(1000);
-  right_turnback();
-  delay(1000);
-  stop();
-  delay(1000);
-  */
-  
+
+  unsigned long traveled = ((pulse_count_L - milestone_start_L) + (pulse_count_R - milestone_start_R)) / 2;
+  unsigned long target_pulses = (unsigned long)(PATH[path_index].distance_m * PULSES_PER_METER + 0.5);
+  if (traveled >= target_pulses) {
+    runPathStepManeuver();
+  }
 }
