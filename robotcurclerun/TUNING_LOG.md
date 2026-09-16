@@ -41,7 +41,11 @@ the LM393 wheel encoders (`pulse_count_L`, `pulse_count_R`):
 | 0.81  | 1.4 | >1 pulse | (not logged before moving on) |
 | 0.79  | 1.4 | >1 pulse | One log run showed Right stuck at 0 while Left froze — diagnosed as a **hardware** issue (wheel/encoder not physically turning), not a regression from this value. |
 | 0.82  | 1.4 | >1 pulse | RPM nearly matched (~1.8% diff, 25.65 vs 25.15 rev) — but robot still visibly veered right. Since RPM was balanced, this pointed to a **mechanical** cause (wheel diameter/tire wear, chassis alignment, uneven weight/friction) rather than a PWM/software issue. |
-| 0.825 | 1.4 | >1 pulse | After the mechanical check, nudged up half a step from 0.82 because 0.82-ish settings had started drifting left instead of right (overshoot from 0.02 steps being too coarse). Reported as "starting to go straight." **Current value in the sketch.** |
+| 0.825 | 1.4 | >1 pulse | After the mechanical check, nudged up half a step from 0.82 because 0.82-ish settings had started drifting left instead of right (overshoot from 0.02 steps being too coarse). Reported as "starting to go straight." |
+| 0.82  | 1.4 | >1 pulse | Path-routine hardware run, left-drift starting ~80cm into straight. Nudged down. |
+| 0.815 | 1.4 | >1 pulse | Flipped: visibly veered right. True balance point bracketed between 0.815 and 0.82. |
+| 0.818 | 1.4 | >1 pulse | Fresh path-routine log: Right pulses pulled ahead of Left, gap widening across segments 0-1 (e.g. 1219 vs 1281, diff 62). Visually still veered left. |
+| 0.816 | 1.4 | >1 pulse | Bisecting between 0.815 (right) and 0.818 (left). **Current value in the sketch — not yet confirmed on hardware.** |
 
 ## Open items / follow-ups
 
@@ -131,3 +135,59 @@ routine was added. Fixed by scaling `ENA`'s PWM by `MOTOR_L_RATIO` in
   estimates, not a protractor measurement — revisit with a marked-angle
   floor test if step-to-step heading error compounds visibly over the
   5-segment route.
+
+## Single-wheel pivot (spin) rolled out to legs 1-4 + turn_left() direction bug
+
+### Single-wheel pivot applied to all legs
+
+Leg 1 already used `pivotLeftForward()`/`pivotLeftBackward()` (single-wheel
+pivot: one wheel stationary, the other drives) for its spin. Legs 2-4 were
+still using `turn_left()`/`turn_right()` (two-wheel pivot) for their spin
+step. Switched legs 2-4's spin call to the single-wheel pivot too, matching
+direction to the original comment (`spin left` -> `pivotLeftBackward`,
+`spin right` -> `pivotLeftForward`).
+
+### turn_left() direction bug
+
+`turn_left()`'s `digitalWrite(IN1..IN4)` block was byte-for-byte identical to
+`turn_right()`'s (both wrote left-forward/right-backward), despite the
+comment above it saying "Left backward, Right forward". Result: calling
+`turn_left()` always spun the robot right, regardless of which function was
+called. Fixed both the main spin direction and the counter-torque brake
+block inside `turn_left()` to actually drive left-backward/right-forward.
+
+### Spin vs. turn value mix-up in loop()
+
+While re-tuning, `LEG{n}_SPIN_DEG` and `LEG{n}_TURN_DEG` constants ended up
+holding each other's values (small ~0-90° corner-turn numbers sitting in
+`SPIN_DEG`, large ~360-630° full-spin numbers sitting in `TURN_DEG`). Rather
+than re-guess the intended numbers, swapped which constant feeds which call
+in `loop()`: the pivot spin call now takes `LEG{n}_TURN_DEG` and `turn_right`/
+`turn_left` now takes `LEG{n}_SPIN_DEG`, so the large values drive the full
+spin and the small values drive the corner turn again.
+
+### Missing encoder feedback during turns
+
+Audited whether any turn/spin function uses the encoders to correct L/R
+balance mid-turn (not just as a stop condition) — none did:
+
+- `turn_right()`/`turn_left()`: encoder pulses were only checked as an
+  average (`(pulse_count_L + pulse_count_R) / 2 >= target_pulses`) to decide
+  when to stop; PWM stayed frozen at launch value for the whole turn.
+- `pivotLeftForward()`/`pivotLeftBackward()`: didn't use the encoder at all
+  to stop — pure `millis()`-based timing; `pulse_count_L` was only read
+  *after* stopping, as a "did the wheel even turn" diagnostic.
+
+This explains inconsistent real-world rotation angle from run to run (no
+correction for wheel slip, friction differences, or battery sag mid-turn).
+Fixed both:
+
+- `pivotLeftForward()`/`pivotLeftBackward()`: now stop on `pulse_count_L`
+  reaching a target computed from the single-wheel pivot's arc (radius =
+  full `TRACK_WIDTH_CM`, so 2x the two-wheel pivot's arc at the same angle),
+  with a timeout fallback instead of pure timing.
+- `turn_right()`/`turn_left()`: added a live correction loop mid-turn using
+  `error = pulse_count_L - pulse_count_R` through the existing `Kp_enc`/
+  `Ki_enc` gains (same pattern as `forward()`), biasing per-wheel PWM so
+  both sides rotate the same amount instead of running both wheels at a
+  fixed speed for the whole turn.
