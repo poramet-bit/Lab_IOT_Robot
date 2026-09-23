@@ -1,0 +1,5 @@
+eventId,event2,event3,steps2Range,steps3Range,heading
+1,1,1,2-8,2-8,SE (135°)
+2,1,2,2-8,9-12,SE (135°)
+3,2,1,9-12,2-8,SE (135°)
+4,2,2,9-12,9-12,SE (135°)

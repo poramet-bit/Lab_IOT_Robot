@@ -1,7 +1,6 @@
 #include <Wire.h>
 #include "Arduino_LED_Matrix.h"
 #include "/home/poramet/Documents/Lab_IOT_Robot/animation/animation.h"
-#include <ArduinoBLE.h>
 
 // ============================================================================
 // 0. สารบัญตัวแปรปรับค่า (TUNING CHEAT SHEET)
@@ -160,49 +159,10 @@ void resetEncoders() {
 float getRevolutionsL() { return (float)pulse_count_L / DISK_SLOTS; }
 float getRevolutionsR() { return (float)pulse_count_R / DISK_SLOTS; }
 
-// ============================================================================
-// 4. BLUETOOTH LOW ENERGY (BLE) - NORDIC UART SERVICE (iOS & Android)
-// ============================================================================
-const bool USE_BLE = true; // เปิดใช้งาน Bluetooth ไร้สายสำหรับ iPhone
-BLEService uartService("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
-BLECharacteristic txChar("6E400003-B5A3-F393-E0A9-E50E24DCCA9E", BLENotify, 64);
-BLECharacteristic rxChar("6E400002-B5A3-F393-E0A9-E50E24DCCA9E", BLEWrite | BLEWriteWithoutResponse, 64);
-bool ble_connected = false;
 bool emergency_stop = false;
 
 void sendTelemetry(const String &msg) {
   Serial.println(msg);
-  if (USE_BLE && ble_connected && txChar.subscribed()) {
-    txChar.writeValue(msg.c_str(), msg.length());
-  }
-}
-
-void processBLE() {
-  if (!USE_BLE) return;
-  BLE.poll();
-  BLEDevice central = BLE.central();
-  if (central && central.connected()) {
-    ble_connected = true;
-    if (rxChar.written()) {
-      int len = rxChar.valueLength();
-      const uint8_t* val = rxChar.value();
-      String cmd = "";
-      for (int i = 0; i < len; i++) cmd += (char)val[i];
-      cmd.trim();
-      cmd.toUpperCase();
-      if (cmd == "STOP") {
-        emergency_stop = true;
-        analogWrite(ENA, 0);
-        analogWrite(ENB, 0);
-        sendTelemetry("[BLE CMD] EMERGENCY STOP ACTIVATED!");
-      } else if (cmd == "START") {
-        emergency_stop = false;
-        sendTelemetry("[BLE CMD] START RECEIVED!");
-      }
-    }
-  } else {
-    ble_connected = false;
-  }
 }
 
 // ============================================================================
@@ -409,13 +369,12 @@ void forward(int speed_motorL, int speed_motorR, int B_L = 0, int B_R = 0, float
       last_anim_time = millis();
     }
 
-    processBLE();
     if (emergency_stop) {
       stop();
       break;
     }
 
-    // Telemetry print every 300 ms (Outputs to both USB Serial and Bluetooth BLE)
+    // Telemetry print every 300 ms (USB Serial)
     if (millis() - last_print_time >= 300) {
       String t = " L: " + String(pulse_count_L) + " | R: " + String(pulse_count_R) + " | PWM: " + String(current_L) + "/" + String(current_R);
       sendTelemetry(t);
@@ -512,7 +471,6 @@ void forwardBoostLeftAfter(float distance_cm, float boost_at_cm, float boost_rat
       last_anim_time = millis();
     }
 
-    processBLE();
     if (emergency_stop) {
       stop();
       break;
@@ -914,22 +872,6 @@ void setup() {
 
   // Initialize MPU-6050
   initMPU6050();
-
-  // Initialize Bluetooth Low Energy (BLE)
-  if (USE_BLE) {
-    if (BLE.begin()) {
-      BLE.setLocalName("IOT-ROBOT");
-      BLE.setDeviceName("IOT-ROBOT");
-      BLE.setAdvertisedService(uartService);
-      uartService.addCharacteristic(txChar);
-      uartService.addCharacteristic(rxChar);
-      BLE.addService(uartService);
-      BLE.advertise();
-      Serial.println("[BLE] Bluetooth Online! Device Name: IOT-ROBOT");
-    } else {
-      Serial.println("[BLE] Warning: BLE failed to initialize!");
-    }
-  }
 
   Serial.println("System Ready! Waiting to start...");
 }

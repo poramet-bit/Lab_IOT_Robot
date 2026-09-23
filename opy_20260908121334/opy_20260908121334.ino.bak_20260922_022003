@@ -1,0 +1,370 @@
+// --- กำหนดขามอเตอร์ ---
+int ENA = 5;
+int IN1 = 6;
+int IN2 = 7;
+
+int ENB = 10;
+int IN3 = 8;
+int IN4 = 9;
+
+// --- ความเร็วรถ เท่ากันทุกจุด ปรับที่นี่ที่เดียว ไม่ต้องใส่ทุกครั้งที่เรียกฟังก์ชัน ---
+int SPEED = 4000;      // ความเร็วเดินหน้า/ถอยหลัง
+int TURN_SPEED = 4000; // ความเร็วตอนหมุน
+
+// --- ตัวแปรปรับแก้ค่าความเร็ว (กรณีล้อวิ่งไม่เท่ากัน) ---
+int B_L = 250;
+int B_R = 0;
+
+// --- ตัวหักเลี้ยวแก้เอียงระหว่างวิ่งตรง (เทียบพัลส์ซ้าย-ขวาสด) ---
+float Kp_balance = 5.0; // ยิ่งสูงยิ่งแก้ไว แต่ส่ายง่าย ต้องทดสอบจริงแล้วปรับ
+
+// --- เรขาคณิตรถ สำหรับแปลง "องศาที่อยากหมุน" เป็น "จำนวนพัลส์" (ค่าเริ่มต้น ต้องวัดจากรถจริง) ---
+const int DISK_SLOTS = 20;              // จำนวนรูบนแผ่น encoder (1 รอบล้อ)
+const float WHEEL_DIAMETER_CM = 6.5;    // เส้นผ่านศูนย์กลางล้อ (ซม.) - แก้ตามล้อจริง
+const float TRACK_WIDTH_CM = 14.5;      // ระยะห่างล้อซ้าย-ขวา (ซม.) - แก้ตามตัวถังจริง
+const float WHEEL_CIRCUMFERENCE_CM = 3.14159265 * WHEEL_DIAMETER_CM;
+const float CM_PER_PULSE_THEORY = WHEEL_CIRCUMFERENCE_CM / DISK_SLOTS;
+float CM_PER_PULSE_CAL = 1.0; // ตัวชดเชยจากการวัดจริง (ล้อลื่นไถล/เฟืองสูญเสีย ทำให้เรขาคณิตล้วนๆ ไม่ตรง)
+                               // วิธีคาลิเบรต: สั่งวิ่ง 100cm วัดระยะจริง -> ระยะจริงเกิน = เพิ่มค่านี้ขึ้น, ระยะจริงขาด = ลดค่านี้ลง
+float CM_PER_PULSE = CM_PER_PULSE_THEORY * CM_PER_PULSE_CAL;
+float TURN_DEG_SCALE = 1.0; // ตัวชดเชยมุมหมุนจริง (จากที่ทดลองวัด) - เริ่ม 1.0 แล้วทดสอบจริงค่อยปรับ
+
+// แปลงองศาที่อยากหมุน เป็นจำนวนพัลส์เป้าหมาย (สูตร arc length ของวงกลมล้อหมุนรอบจุดกึ่งกลางตัวถัง)
+unsigned long degToPulses(float target_deg) {
+  return (unsigned long)(((target_deg * TURN_DEG_SCALE) / 360.0) * (3.14159265 * TRACK_WIDTH_CM / CM_PER_PULSE));
+}
+
+// --- ตำแหน่ง/ทิศทางรถ (dead-reckoning จากพัลส์ encoder) เพื่อให้กำหนด "จุดหมาย" (x, y) ได้ ---
+// origin (0,0) = จุดเริ่มต้นตอนเปิดเครื่อง, heading 0 = ทิศที่รถหันตอนเริ่ม, มุมเพิ่ม = เลี้ยวซ้าย (ทวนเข็ม)
+float pos_x = 0.0;
+float pos_y = 0.0;
+float heading_deg = 0.0;
+
+float normalizeAngle(float a) {
+  while (a > 180.0) a -= 360.0;
+  while (a <= -180.0) a += 360.0;
+  return a;
+}
+
+// --- ค่าคงที่แต่ละ leg ของเส้นทาง: ระยะวิ่งรวม + จุดหักแก้เอียงกลางทาง (สูงสุด 2 จุด) + หมุนปิดท้าย ---
+// CORRECTION_AT_CM = 0 หมายถึง "ไม่ใช้จุดนี้" (ข้าม)
+const float LEG1_FORWARD_CM = 820;
+const float LEG1_SPIN_DEG = 563.75; const bool LEG1_SPIN_RIGHT = true;  // spin right
+const float LEG1_TURN_DEG = 0.0;  const bool LEG1_TURN_LEFT = true;  // turn left
+const float LEG1_CORRECTION_DEG = 20.0;
+const float LEG1_CORRECTION_AT_CM = 200.0;
+const float LEG1_CORRECTION3_DEG = 0.0;   // จุดเลี้ยวที่ 3 (ยังไม่ใช้): เติมองศา + ตำแหน่ง cm เพื่อเปิดใช้
+const float LEG1_CORRECTION3_AT_CM = 0.0; // 0 = ปิดใช้งานจุดนี้
+
+const float LEG2_FORWARD_CM = 1150.0;
+const float LEG2_SPIN_DEG = 943.75; const bool LEG2_SPIN_RIGHT = false; // spin left
+const float LEG2_TURN_DEG = 0;    const bool LEG2_TURN_LEFT = false; // turn right
+const float LEG2_CORRECTION_DEG = 10.0; // ออกขวาตอนวิ่งผ่าน 500cm หักซ้ายชดเชย
+const float LEG2_CORRECTION_AT_CM = 100.0;
+const float LEG2_CORRECTION2_DEG = 30.0;
+const float LEG2_CORRECTION2_AT_CM = 600.0;
+const float LEG2_CORRECTION3_DEG = 10.0;   // หักซ้าย 10 องศา ที่ 900cm
+const float LEG2_CORRECTION3_AT_CM = 900.0;
+
+
+const float LEG3_FORWARD_CM = 860.0;
+const float LEG3_SPIN_DEG = 565; const bool LEG3_SPIN_RIGHT = true;  // spin right
+const float LEG3_TURN_DEG = 0.0;  const bool LEG3_TURN_LEFT = true;  // turn left
+const float LEG3_CORRECTION_DEG = 35;
+const float LEG3_CORRECTION_AT_CM = 50.0;
+const float LEG3_CORRECTION2_DEG = -10.0;
+const float LEG3_CORRECTION2_AT_CM = 400.0;
+const float LEG3_CORRECTION3_DEG = 0.0;   // จุดเลี้ยวที่ 3 (ยังไม่ใช้): เติมองศา + ตำแหน่ง cm เพื่อเปิดใช้
+const float LEG3_CORRECTION3_AT_CM = 0.0; // 0 = ปิดใช้งานจุดนี้
+
+const float LEG4_FORWARD_CM = 1190.0;
+const float LEG4_SPIN_DEG = .0; const bool LEG4_SPIN_RIGHT = false; // spin left
+const float LEG4_TURN_DEG = 0.0;    const bool LEG4_TURN_LEFT = false; // turn right
+const float LEG4_CORRECTION_DEG = 20.0;
+const float LEG4_CORRECTION_AT_CM = 100.0;
+const float LEG4_CORRECTION2_DEG = -10.0;
+const float LEG4_CORRECTION2_AT_CM = 350.0;
+const float LEG4_CORRECTION3_DEG = 0.0;   // จุดเลี้ยวที่ 3 (ยังไม่ใช้): เติมองศา + ตำแหน่ง cm เพื่อเปิดใช้
+const float LEG4_CORRECTION3_AT_CM = 0.0; // 0 = ปิดใช้งานจุดนี้
+
+// --- LM393 Speed Encoders (นับพัลส์แทนการจับเวลา) ---
+const int ENCODER_L = 2; // ต้องเป็นขา interrupt
+const int ENCODER_R = 3; // ต้องเป็นขา interrupt
+
+volatile unsigned long pulse_count_L = 0;
+volatile unsigned long pulse_count_R = 0;
+
+void isr_count_L() { pulse_count_L++; }
+void isr_count_R() { pulse_count_R++; }
+
+void resetEncoders() {
+  pulse_count_L = 0;
+  pulse_count_R = 0;
+}
+
+// พิมพ์ค่าพัลส์ล้อซ้าย-ขวาออก Serial ทุก 200ms (มอนิเตอร์ว่าล้อวิ่งเท่ากันไหม)
+void printWheelPulses() {
+  static unsigned long last_print_time = 0;
+  if (millis() - last_print_time >= 200) {
+    Serial.print("L: ");
+    Serial.print(pulse_count_L);
+    Serial.print(" | R: ");
+    Serial.println(pulse_count_R);
+    last_print_time = millis();
+  }
+}
+
+// รอจนพัลส์เฉลี่ย (L+R)/2 ถึงเป้า หรือหมดเวลากันชน (กันค้างถ้าพัลส์ขาด/ไฟตก)
+void waitForPulses(unsigned long target_pulses, unsigned long timeout_ms) {
+  unsigned long start_time = millis();
+  while (((pulse_count_L + pulse_count_R) / 2) < target_pulses) {
+    if (millis() - start_time > timeout_ms) break; // safety timeout กันค้างถ้านับพัลส์พลาด
+    printWheelPulses();
+    delay(2);
+  }
+}
+
+// รอจนพัลส์ครบเป้า พร้อมหักเลี้ยวแก้เอียงสด ๆ ระหว่างทาง (ใช้เฉพาะเดินหน้า/ถอยหลังตรง มี B_L/B_R trim)
+void waitForPulsesBalanced(int pwr, unsigned long target_pulses, unsigned long timeout_ms) {
+  unsigned long start_time = millis();
+  while (((pulse_count_L + pulse_count_R) / 2) < target_pulses) {
+    if (millis() - start_time > timeout_ms) break; // safety timeout กันค้างถ้านับพัลส์พลาด
+
+    long error = (long)pulse_count_L - (long)pulse_count_R; // ซ้ายเกิน = error บวก
+    int correction = (int)(error * Kp_balance);
+    analogWrite(ENA, constrain(pwr - B_L - correction, 0, 4095));
+    analogWrite(ENB, constrain(pwr - B_R + correction, 0, 4095));
+
+    printWheelPulses();
+    delay(10);
+  }
+}
+
+// เหมือน waitForPulsesBalanced แต่ไม่ใส่ B_L/B_R trim (ใช้ตอนหมุนอยู่กับที่ อยากให้สองล้อเท่ากันเป๊ะ ไม่เอียงไปทางใดทางหนึ่ง)
+void waitForPulsesBalancedTurn(int pwr, unsigned long target_pulses, unsigned long timeout_ms) {
+  unsigned long start_time = millis();
+  while (((pulse_count_L + pulse_count_R) / 2) < target_pulses) {
+    if (millis() - start_time > timeout_ms) break; // safety timeout กันค้างถ้านับพัลส์พลาด
+
+    long error = (long)pulse_count_L - (long)pulse_count_R; // ซ้ายเกิน = error บวก
+    int correction = (int)(error * Kp_balance);
+    analogWrite(ENA, constrain(pwr - correction, 0, 4095));
+    analogWrite(ENB, constrain(pwr + correction, 0, 4095));
+
+    printWheelPulses();
+    delay(10);
+  }
+}
+
+// เวลาสูงสุดต่อ 1 พัลส์ ที่ยอมให้รอ (กันหุ่นวิ่งค้าง/ล้อไม่หมุน) - ต้องมากกว่าเวลาจริงต่อพัลส์
+// ที่ความเร็วช้าสุดที่เป็นไปได้ ไม่งั้น timeout จะตัดตอนก่อนถึงเป้าในระยะ/มุมที่ยาว (เช่น leg ไกลๆ)
+float TIMEOUT_MS_PER_PULSE = 10.0;
+unsigned long MIN_TIMEOUT_MS = 3000;
+
+unsigned long computeTimeoutMs(unsigned long target_pulses) {
+  unsigned long t = (unsigned long)(target_pulses * TIMEOUT_MS_PER_PULSE);
+  return t < MIN_TIMEOUT_MS ? MIN_TIMEOUT_MS : t;
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  pinMode(ENCODER_L, INPUT_PULLUP);
+  pinMode(ENCODER_R, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_L), isr_count_L, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_R), isr_count_R, RISING);
+
+  analogWriteResolution(12); // กำหนดค่า PWM 0-4095 (สำหรับบอร์ด Arduino UNO R4 / ESP32)
+
+  //delay(2000); // หน่วงเวลา 2 วินาทีก่อนเริ่มทำงาน
+
+  // ==========================================
+  // เส้นทางแบ่งเป็น 4 leg ปรับค่าได้ที่ค่าคงที่ LEGx_* ด้านบนที่เดียว ไม่ต้องแก้ตรงนี้
+  // ความเร็วปรับที่ SPEED/TURN_SPEED ด้านบน เท่ากันทุกจุดทั้งเส้นทาง
+  // ==========================================
+  stopRobot(2000);
+
+  runLeg(LEG1_FORWARD_CM, LEG1_SPIN_DEG, LEG1_SPIN_RIGHT, LEG1_TURN_DEG, LEG1_TURN_LEFT,
+         LEG1_CORRECTION_DEG, LEG1_CORRECTION_AT_CM, 0, 0,
+         LEG1_CORRECTION3_DEG, LEG1_CORRECTION3_AT_CM);
+  stopRobot(300);
+
+  runLeg(LEG2_FORWARD_CM, LEG2_SPIN_DEG, LEG2_SPIN_RIGHT, LEG2_TURN_DEG, LEG2_TURN_LEFT,
+         LEG2_CORRECTION_DEG, LEG2_CORRECTION_AT_CM, LEG2_CORRECTION2_DEG, LEG2_CORRECTION2_AT_CM,
+         LEG2_CORRECTION3_DEG, LEG2_CORRECTION3_AT_CM);
+  stopRobot(300);
+
+  runLeg(LEG3_FORWARD_CM, LEG3_SPIN_DEG, LEG3_SPIN_RIGHT, LEG3_TURN_DEG, LEG3_TURN_LEFT,
+         LEG3_CORRECTION_DEG, LEG3_CORRECTION_AT_CM, LEG3_CORRECTION2_DEG, LEG3_CORRECTION2_AT_CM,
+         LEG3_CORRECTION3_DEG, LEG3_CORRECTION3_AT_CM);
+  stopRobot(300);
+
+  runLeg(LEG4_FORWARD_CM, LEG4_SPIN_DEG, LEG4_SPIN_RIGHT, LEG4_TURN_DEG, LEG4_TURN_LEFT,
+         LEG4_CORRECTION_DEG, LEG4_CORRECTION_AT_CM, LEG4_CORRECTION2_DEG, LEG4_CORRECTION2_AT_CM,
+         LEG4_CORRECTION3_DEG, LEG4_CORRECTION3_AT_CM);
+
+  // จบการทำงาน
+}
+
+void loop() {
+  // ปล่อยว่างไว้ เพื่อไม่ให้หุ่นยนต์ทำงานวนซ้ำ
+}
+
+// -------------------------------------------------------------
+// ฟังก์ชันควบคุมการเคลื่อนที่แบบระบุระยะทาง (distance_cm) แทนเวลา
+// -------------------------------------------------------------
+
+void forward(float distance_cm) {
+  resetEncoders();
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+
+  analogWrite(ENA, constrain(SPEED - B_L, 0, 4095));
+  analogWrite(ENB, constrain(SPEED - B_R, 0, 4095));
+  unsigned long target_pulses = (unsigned long)(distance_cm / CM_PER_PULSE);
+  waitForPulsesBalanced(SPEED, target_pulses, computeTimeoutMs(target_pulses));
+
+  float rad = heading_deg * PI / 180.0;
+  pos_x += distance_cm * cos(rad);
+  pos_y += distance_cm * sin(rad);
+}
+
+void backward(float distance_cm) {
+  resetEncoders();
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, constrain(SPEED - B_L, 0, 4095));
+  analogWrite(ENB, constrain(SPEED - B_R, 0, 4095));
+  unsigned long target_pulses = (unsigned long)(distance_cm / CM_PER_PULSE);
+  waitForPulsesBalanced(SPEED, target_pulses, computeTimeoutMs(target_pulses));
+
+  float rad = heading_deg * PI / 180.0;
+  pos_x -= distance_cm * cos(rad);
+  pos_y -= distance_cm * sin(rad);
+}
+
+// ไปยังจุดหมาย (target_x, target_y) หน่วยเซนติเมตร เทียบจากจุดเริ่มต้น: หันหน้าเข้าเป้าแล้ววิ่งตรงไปตามระยะจริง
+void goToPoint(float target_x, float target_y) {
+  float dx = target_x - pos_x;
+  float dy = target_y - pos_y;
+  float distance = sqrt(dx * dx + dy * dy);
+  float target_heading = atan2(dy, dx) * 180.0 / PI;
+  float turn_needed = normalizeAngle(target_heading - heading_deg);
+
+  if (turn_needed > 0.5) {
+    around_left(turn_needed);
+  } else if (turn_needed < -0.5) {
+    around_right(-turn_needed);
+  }
+
+  forward(distance);
+}
+
+// วิ่ง leg เดียว: เดินหน้ารวม forward_cm, หักแก้เอียงกลางทางได้สูงสุด 2 จุด (at_cm=0 = ข้าม), จบด้วยหมุนสปิน + หมุนปรับทิศ
+void runLeg(float forward_cm,
+            float spin_deg, bool spin_right,
+            float turn_deg, bool turn_left,
+            float corr1_deg, float corr1_at_cm,
+            float corr2_deg, float corr2_at_cm,
+            float corr3_deg, float corr3_at_cm) {
+  float bp_cm[3];
+  float bp_deg[3];
+  int n = 0;
+  if (corr1_at_cm > 0) { bp_cm[n] = corr1_at_cm; bp_deg[n] = corr1_deg; n++; }
+  if (corr2_at_cm > 0) { bp_cm[n] = corr2_at_cm; bp_deg[n] = corr2_deg; n++; }
+  if (corr3_at_cm > 0) { bp_cm[n] = corr3_at_cm; bp_deg[n] = corr3_deg; n++; }
+  // เรียง bp_cm[] จากน้อยไปมาก (bubble sort ธรรมดา รองรับสูงสุด 3 จุด) กันลำดับ
+  // ที่ใส่มาไม่ตรงกับตำแหน่งจริง (เช่น จุด2 อยู่ใกล้ต้นทางกว่าจุด1)
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = 0; j < n - 1 - i; j++) {
+      if (bp_cm[j] > bp_cm[j + 1]) {
+        Serial.println("[runLeg] WARNING: correction points out of order -> swapped to match actual position");
+        float tc = bp_cm[j]; bp_cm[j] = bp_cm[j + 1]; bp_cm[j + 1] = tc;
+        float td = bp_deg[j]; bp_deg[j] = bp_deg[j + 1]; bp_deg[j + 1] = td;
+      }
+    }
+  }
+
+  float dist_so_far = 0;
+  for (int i = 0; i < n; i++) {
+    float seg = bp_cm[i] - dist_so_far;
+    if (seg <= 0) {
+      Serial.println("[runLeg] WARNING: correction point <= previous point, skipped (would be zero/negative distance)");
+      continue;
+    }
+    if (bp_cm[i] >= forward_cm) {
+      Serial.println("[runLeg] WARNING: correction point >= forward_cm, skipped");
+      continue;
+    }
+    forward(seg);
+    dist_so_far = bp_cm[i];
+    stopRobot(1000); // หยุดนิ่ง 1 วิ ก่อนหมุนแก้เอียง
+    if (bp_deg[i] > 0) around_left(bp_deg[i]);
+    else if (bp_deg[i] < 0) around_right(-bp_deg[i]);
+  }
+  float remaining_cm = forward_cm - dist_so_far;
+  if (remaining_cm < 0) {
+    Serial.println("[runLeg] WARNING: remaining distance negative, clamped to 0");
+    remaining_cm = 0;
+  }
+  forward(remaining_cm);
+
+  if (spin_deg != 0 || turn_deg != 0) {
+    stopRobot(1000); // หยุดนิ่ง 1 วิ ก่อนหมุนปิดท้าย leg
+  }
+  if (spin_deg != 0) {
+    if (spin_right) around_right(spin_deg); else around_left(spin_deg);
+  }
+  if (turn_deg != 0) {
+    if (turn_left) around_left(turn_deg); else around_right(turn_deg);
+  }
+}
+
+void around_left(float target_deg) {
+  resetEncoders();
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH); // ล้อซ้ายถอยหลัง
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH); // ล้อขวาเดินหน้า
+
+  analogWrite(ENA, constrain(TURN_SPEED , 0, 4095));
+  analogWrite(ENB, constrain(TURN_SPEED , 0, 4095));
+  unsigned long target_pulses = degToPulses(target_deg);
+  waitForPulsesBalancedTurn(TURN_SPEED, target_pulses, computeTimeoutMs(target_pulses)); // แก้ให้ล้อหมุนรอบเท่ากันด้วย
+  heading_deg = normalizeAngle(heading_deg + target_deg);
+}
+
+void around_right(float target_deg) {
+  resetEncoders();
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);  // ล้อซ้ายเดินหน้า
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(ENA, constrain(TURN_SPEED , 0, 4095));
+  analogWrite(ENB, constrain(TURN_SPEED , 0, 4095));
+  unsigned long target_pulses = degToPulses(target_deg);
+  waitForPulsesBalancedTurn(TURN_SPEED, target_pulses, computeTimeoutMs(target_pulses)); // แก้ให้ล้อหมุนรอบเท่ากันด้วย
+  heading_deg = normalizeAngle(heading_deg - target_deg);
+}
+
+void stopRobot(int time_ms) {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  delay(time_ms);
+}
